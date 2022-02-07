@@ -147,3 +147,8 @@ data/
 #lib/modules/*.csv
 #!lib/inverters
 #lib/inverters/*.csv
+isc_logo.jpg
+results_pdf
+results_pdf.html
+results_pdf.json
+test
