@@ -170,8 +170,8 @@ class System(th_e_core.System):
         for key, configs in self.items():
             if key == 'array':
                 result = results[key]
-                results_kwp += float(configs.module_parameters['pdc0']) * \
-                               configs.inverters_per_system * configs.modules_per_inverter / 1000
+                results_kwp += float(configs.module_parameters['pdc0']) * configs.inverters_per_system * \
+                               configs.modules_per_inverter / 1000
                 results_total[[AC_P, DC_P]] += result[['p_ac', 'p_dc']].abs().values
 
                 p_pv = results[key]['p_dc'].to_frame()
@@ -179,116 +179,122 @@ class System(th_e_core.System):
                 p_pv = p_pv.rename(columns={'p_dc': 'p_pv'})
                 results.update({'daily': p_pv})
 
-            elif key == 'ees':
-                # TODO: Abfrage ob tz-infos vorhanden
-                # p_isc.index = p_isc.index.tz_localize('Europe/Berlin')
-                # TODO: N.A./null Werte in der Zeitreihe
-                domestic = pd.read_csv(configs.data_path, delimiter=',', index_col='time', parse_dates=True,
-                                       dayfirst=True)
-                start = domestic.index[0]
-                stop = domestic.index[-1]
-                energy_price = configs.energy_price
-                domestic.index = (domestic.index + dt.timedelta(minutes=30))[:].floor('H')
-                # TODO: delete following line (used because ISC consumption used for domestic consumption)
-                # domestic = domestic / 100
-                power = domestic.rename(columns={'power': 'p_dom'})
+        evaluation = False
+        key = 'ees'
+        if key in self:
+            # TODO: Abfrage ob tz-infos vorhanden
+            # p_isc.index = p_isc.index.tz_localize('Europe/Berlin')
+            # TODO: N.A./null Werte in der Zeitreihe
+            evaluation = True
+            configs = self[key]
+            domestic = pd.read_csv(configs.data_path, delimiter=',', index_col='time', parse_dates=True,
+                                   dayfirst=True)
+            start = domestic.index[0]
+            stop = domestic.index[-1]
+            energy_price = configs.energy_price
+            domestic.index = (domestic.index + dt.timedelta(minutes=30))[:].floor('H')
+            # TODO: delete following line (used because ISC consumption used for domestic consumption)
+            # domestic = domestic / 100
+            power = domestic.rename(columns={'power': 'p_dom'})
 
-                if results != {}:
-                    p_pv = results['array'][['p_ac']]
-                    p_pv.index = p_pv.index.tz_convert(None)
-                    p_pv.index = p_pv.index[:].floor('H')
-                    p_pv = p_pv.rename(columns={'p_ac': 'p_pv'})
-                    power = power.join(p_pv)
-                else:
-                    print('No pv available.')
-                    power_pv = pd.DataFrame(columns={'p_pv'}, index=power.index, data=np.zeros(power.values.__len__()))
-                    power = power.join(power_pv)
+            if results != {}:
+                p_pv = results['array'][['p_ac']]
+                p_pv.index = p_pv.index.tz_convert(None)
+                p_pv.index = p_pv.index[:].floor('H')
+                p_pv = p_pv.rename(columns={'p_ac': 'p_pv'})
+                power = power.join(p_pv)
+            else:
+                print('No pv available.')
+                power_pv = pd.DataFrame(columns={'p_pv'}, index=power.index, data=np.zeros(power.values.__len__()))
+                power = power.join(power_pv)
 
-                p_dom = domestic['power'].to_frame()
-                p_dom = p_dom.groupby(p_dom.index.hour).mean()
-                p_dom = p_dom.rename(columns={'power': 'p_dom'})
-                if results != {}:
-                    p_dom = pd.concat([p_dom, results['daily']], axis=1, join='inner')
-                results.update({'daily': p_dom})
+            p_dom = domestic['power'].to_frame()
+            p_dom = p_dom.groupby(p_dom.index.hour).mean()
+            p_dom = p_dom.rename(columns={'power': 'p_dom'})
+            if results != {}:
+                p_dom = pd.concat([p_dom, results['daily']], axis=1, join='inner')
+            results.update({'daily': p_dom})
 
-                # energy yield and costs
-                pv_yield = power['p_pv'][start:stop].sum()
-                consumption = power['p_dom'][start:stop].sum()
-                energy_yield = pv_yield - consumption
-                energy_balance = (power['p_pv'][start:stop] - power['p_dom'][start:stop]) / 1000
+            # energy yield and costs
+            pv_yield = power['p_pv'][start:stop].sum()
+            consumption = power['p_dom'][start:stop].sum()
+            energy_yield = pv_yield - consumption
+            energy_balance = (power['p_pv'][start:stop] - power['p_dom'][start:stop]) / 1000
 
-                # energy costs raw
-                energy_costs_raw = (-consumption / 1000 * configs.energy_price).sum()
+            # energy costs raw
+            energy_costs_raw = (-consumption / 1000 * configs.energy_price).sum()
 
-                # energy costs with PV
-                energy_costs_pv = 0
-                for dW in energy_balance:
-                    if dW > 0:
-                        energy_costs_pv += dW * configs.feed_in_tariff_pv
-                    elif dW < 0:
-                        energy_costs_pv += dW * configs.energy_price
+            # energy costs with PV
+            energy_costs_pv = 0
+            for dW in energy_balance:
+                if dW > 0:
+                    energy_costs_pv += dW * configs.feed_in_tariff_pv
+                elif dW < 0:
+                    energy_costs_pv += dW * configs.energy_price
 
-                # energy costs with PV and battery
-                energy_costs_bat = 0
-                storage = configs.capacity * 0.5
-                for dW in energy_balance:
-                    if dW > 0:
-                        if storage < configs.capacity:
-                            storage += dW
-                        if storage >= configs.capacity:
-                            if storage > configs.capacity:
-                                dW = storage - configs.capacity
-                                storage = configs.capacity
-                            energy_costs_bat += dW * configs.feed_in_tariff_pv
-                    elif dW < 0:
-                        if storage > 0:
-                            storage += dW
-                        if storage <= 0:
-                            if storage < 0:
-                                dW = storage
-                                storage = 0
-                            energy_costs_bat += dW * configs.energy_price
+            # energy costs with PV and battery
+            energy_costs_bat = 0
+            storage = configs.capacity * 0.5
+            for dW in energy_balance:
+                if dW > 0:
+                    if storage < configs.capacity:
+                        storage += dW
+                    if storage >= configs.capacity:
+                        if storage > configs.capacity:
+                            dW = storage - configs.capacity
+                            storage = configs.capacity
+                        energy_costs_bat += dW * configs.feed_in_tariff_pv
+                elif dW < 0:
+                    if storage > 0:
+                        storage += dW
+                    if storage <= 0:
+                        if storage < 0:
+                            dW = storage
+                            storage = 0
+                        energy_costs_bat += dW * configs.energy_price
 
-                results_ees = {'start': power.index[0],
-                               'stop': power.index[-1],
-                               'costs_raw': [energy_costs_raw],
-                               'costs_pv': [energy_costs_pv],
-                               'costs_pv_bat': [energy_costs_bat]}
+            results_ees = {'start': power.index[0],
+                           'stop': power.index[-1],
+                           'costs_raw': [energy_costs_raw],
+                           'costs_pv': [energy_costs_pv],
+                           'costs_pv_bat': [energy_costs_bat]}
 
-                results.update({key: pd.DataFrame(data=results_ees)})
+            results.update({key: pd.DataFrame(data=results_ees)})
 
-            elif key == 'ev':
-                start = domestic.index[0]
-                stop = domestic.index[-1]
-                if configs.charge_mode == 'SLOW':
-                    charge_duration = 10
-                elif configs.charge_mode == 'NORMAL':
-                    charge_duration = 7
-                elif configs.charge_mode == 'FAST':
-                    charge_duration = 4
-                else:
-                    charge_duration = int(configs.charge_mode)
-                charge_time = [int(x) for x in configs.charge_time.split('-')]
+        key = 'ev'
+        if key in self:
+            configs = self[key]
+            start = domestic.index[0]
+            stop = domestic.index[-1]
+            if configs.charge_mode == 'SLOW':
+                charge_duration = 10
+            elif configs.charge_mode == 'NORMAL':
+                charge_duration = 7
+            elif configs.charge_mode == 'FAST':
+                charge_duration = 4
+            else:
+                charge_duration = int(configs.charge_mode)
+            charge_time = [int(x) for x in configs.charge_time.split('-')]
 
-                data = configs.house_connection_point * 1000 + (results['daily']['p_pv'] - results['daily']['p_dom'])
-                data_tmp = data[charge_time[0]:].append(data[:charge_time[1]])
+            data = configs.house_connection_point * 1000 + (results['daily']['p_pv'] - results['daily']['p_dom'])
+            data_tmp = data[charge_time[0]:].append(data[:charge_time[1]])
 
-                energy_potential = data_tmp.mean() / 1000 * charge_duration
-                energy_potential_min = data_tmp.min() / 1000 * charge_duration
-                km_potential = energy_potential / configs.fuel_consumption * 100
-                km_potential_min = energy_potential_min / configs.fuel_consumption * 100
-                ev_potential = int(km_potential / (configs.driving_distance / 7))
-                ev_potential_min = int(km_potential_min / (configs.driving_distance / 7))
-                ev_distance_total = int(configs.quantity * configs.driving_distance * (stop - start).days / 7)
-                energy_costs_raw = np.round(ev_distance_total / 100 * configs.fuel_consumption * energy_price, 1)
+            energy_potential = data_tmp.mean() / 1000 * charge_duration
+            energy_potential_min = data_tmp.min() / 1000 * charge_duration
+            km_potential = energy_potential / configs.fuel_consumption * 100
+            km_potential_min = energy_potential_min / configs.fuel_consumption * 100
+            ev_potential = int(km_potential / (configs.driving_distance / 7))
+            ev_potential_min = int(km_potential_min / (configs.driving_distance / 7))
+            ev_distance_total = int(configs.quantity * configs.driving_distance * (stop - start).days / 7)
+            energy_costs_raw = np.round(ev_distance_total / 100 * configs.fuel_consumption * energy_price, 1)
 
-                results_ev = {'energy costs': [energy_costs_raw],
-                              'ev potential without LMS': [int(data.min() / 4600)],
-                              'energy potential': [energy_potential_min],
-                              'km potential': [km_potential_min],
-                              'ev potential': [ev_potential_min],
-                              'house connection point': [configs.house_connection_point]}
-                results.update({key: pd.DataFrame(data=results_ev)})
+            results_ev = {'energy costs': [energy_costs_raw],
+                          'ev potential without LMS': [int(data.min() / 4600)],
+                          'energy potential': [energy_potential_min],
+                          'km potential': [km_potential_min],
+                          'ev potential': [ev_potential_min],
+                          'house connection point': [configs.house_connection_point]}
+            results.update({key: pd.DataFrame(data=results_ev)})
 
         results_total[AC_E] = results_total[AC_P] / 1000 * hours
         results_total[AC_Y] = results_total[AC_E] / results_kwp
