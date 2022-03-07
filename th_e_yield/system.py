@@ -34,13 +34,14 @@ class System(th_e_core.System, Evaluation):
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
 
-        self._results_json = os.path.join(data_dir, 'results.json')
-        self._results_excel = os.path.join(data_dir, 'results.xlsx')
-        self._results_csv = os.path.join(data_dir, 'results.csv')
-        self._results_pdf = os.path.join(data_dir, 'results.pdf')
         self._results_dir = os.path.join(data_dir, 'results')
         if not os.path.exists(self._results_dir):
             os.makedirs(self._results_dir)
+
+        self._results_json = os.path.join(self._results_dir, 'results.json')
+        self._results_excel = os.path.join(self._results_dir, 'results.xlsx')
+        self._results_csv = os.path.join(self._results_dir, 'results.csv')
+        self._results_pdf = os.path.join(self._results_dir, 'results.pdf')
 
     def _activate(self, components, configs, **kwargs):
         super()._activate(components, configs, **kwargs)
