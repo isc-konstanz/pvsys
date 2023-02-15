@@ -5,20 +5,17 @@
 
 
 """
+from __future__ import annotations
+from typing import Dict, Iterator
 import os
+import json
 import logging
-
 import numpy as np
 import pandas as pd
 import datetime as dt
-
-from matplotlib import pyplot as plt
-
-from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER, TA_RIGHT
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+import traceback
+from th_e_core import System
+from th_e_core.io import DatabaseUnavailableException
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +28,151 @@ DC_E = 'Energy yield (DC) [kWh]'
 
 class Evaluation:
 
-    def _evaluate_yield(self, results, weather):
-        hours = pd.Series(weather.index, index=weather.index)
+    # noinspection PyProtectedMember
+    def evaluate(self, **kwargs):
+        from th_e_data import Results
+        from th_e_core.io._var import COLUMNS
+        from th_e_data.io import write_csv, write_excel
+        logger.info("Starting evaluation for system: %s", self.name)
+
+        results = Results(self)
+        results.durations.start('Evaluation')
+        results_key = f"{self.id}/output"
+        try:
+            if results_key not in results:
+                results.durations.start('Prediction')
+                result = self(results, self._results_json)
+                results.set(results_key, result)
+                results.durations.stop('Prediction')
+            else:
+                # If this component was simulated already, load the results and skip the calculation
+                results.load(results_key)
+            try:
+                reference = self._get_result(results, f"{self.id}/reference", self.database.read, **kwargs)
+
+                def add_reference(type: str, unit: str = 'power'):
+                    cmpts = self.get_type(type)
+                    if len(cmpts) > 0:
+                        if all([f'{cmpt.id}_{unit}' in reference.columns for cmpt in cmpts]):
+                            results.data[f'{type}_{unit}_ref'] = 0
+                            for cmpt in self.get_type(f'{type}'):
+                                results.data[f'{type}_{unit}_ref'] += reference[f'{cmpt.id}_{unit}']
+                        elif f'{type}_{unit}' in reference.columns:
+                            results.data[f'{type}_{unit}_ref'] = reference[f'{type}_{unit}']
+
+                        results.data[f'{type}_{unit}_err'] = (results.data[f'{type}_{unit}'] -
+                                                              results.data[f'{type}_{unit}_ref'])
+
+                add_reference('pv')
+
+            except DatabaseUnavailableException as e:
+                reference = None
+                logger.debug("Unable to retrieve reference values for system %s: %s", self.name, str(e))
+
+            def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
+                data = data.tz_convert(self.location.timezone).tz_localize(None)
+                data = data[[column for column in COLUMNS.keys() if column in data.columns]]
+                data.rename(columns=COLUMNS, inplace=True)
+                data.index.name = 'Time'
+                return data
+
+            summary = pd.DataFrame(columns=pd.MultiIndex.from_tuples((), names=['System', '']))
+            summary_json = {
+                'status': 'success'
+            }
+            self._evaluate(summary_json, summary, results.data, reference)
+
+            summary_data = {
+                self.name: prepare_data(results.data)
+            }
+            if len(self) > 1:
+                for cmpt in self.values():
+                    results_name = cmpt.name
+                    for cmpt_type in self.get_types():
+                        results_name = results_name.replace(cmpt_type, '')
+                    if len(results_name) < 1:
+                        results_name += str(list(self.values()).index(results_name) + 1)
+                    results_name = (self.name + results_name).title()
+                    summary_data[results_name] = prepare_data(results[f"{self.id}/{cmpt.id}"])
+
+            write_csv(self, summary, self._results_csv)
+            write_excel(summary, summary_data, file=self._results_excel)
+
+            with open(self._results_json, 'w', encoding='utf-8') as f:
+                json.dump(summary_json, f, ensure_ascii=False, indent=4)
+
+        except Exception as e:
+            logger.error("Error evaluating system %s: %s", self.name, str(e))
+            logger.debug("%s: %s", type(e).__name__, traceback.format_exc())
+
+            with open(self._results_json, 'w', encoding='utf-8') as f:
+                results_json = {
+                    'status': 'error',
+                    'message': str(e),
+                    'error': type(e).__name__,
+                    'trace': traceback.format_exc()
+                }
+                json.dump(results_json, f, ensure_ascii=False, indent=4)
+
+            raise e
+
+        finally:
+            results.durations.stop('Evaluation')
+            results.close()
+
+        logger.info("Evaluation complete")
+        logger.debug('Evaluation complete in %i minutes', results.durations['Evaluation'])
+
+        return results
+
+    def _evaluate(self,
+                  summary_json: Dict,
+                  summary: pd.DataFrame,
+                  results: pd.DataFrame,
+                  reference: pd.DataFrame = None) -> None:
+        summary_json.update(self._evaluate_yield(summary, results, reference))
+        summary_json.update(self._evaluate_weather(summary, results))
+
+    def _evaluate_yield(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
+        hours = pd.Series(results.index, index=results.index)
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
+        results_kwp = 0
+        for system in self.values():
+            results_kwp += system.power_max / 1000.
+
+        results['pv_energy'] = results['pv_power'] / 1000. * hours
+        results['pv_yield'] = results['pv_energy'] / results_kwp
+
+        results['dc_energy'] = results['dc_power'] / 1000. * hours
+
+        results.dropna(axis='index', how='all', inplace=True)
+
+        yield_specific = round(results['pv_yield'].sum(), 2)
+        yield_energy = round(results['pv_energy'].sum(), 2)
+
+        summary.loc[self.name, ('Yield', AC_E)] = yield_energy
+        summary.loc[self.name, ('Yield', AC_Y)] = yield_specific
+
+        return {'yield_energy': yield_energy,
+                'yield_specific': yield_specific}
+
+    def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
+        hours = pd.Series(results.index, index=results.index)
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
+        ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
+        dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
+
+        summary.loc[self.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
+        summary.loc[self.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
+
+        return {}
+
+    def _evaluate_system(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
+        hours = pd.Series(results.index, index=results.index)
         hours = round((hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600)
 
         results_total_columns = [AC_P, AC_E, AC_Y, DC_P]
-        results_total = pd.DataFrame(index=weather.index, columns=[AC_P, DC_P]).fillna(0)
+        results_total = pd.DataFrame(index=results.index, columns=[AC_P, DC_P]).fillna(0)
         results_total.index.name = 'Time'
         results_kwp = 0
         # results_avg = {}
@@ -183,8 +319,8 @@ class Evaluation:
 
         # self._database.get(file = ../data/system)
 
-        ghi = round((weather['ghi'] / 1000 * hours).sum(), 2)
-        dhi = round((weather['dhi'] / 1000 * hours).sum(), 2)
+        ghi = round((results['ghi'] / 1000 * hours).sum(), 2)
+        dhi = round((results['dhi'] / 1000 * hours).sum(), 2)
 
         results_total = results_total[results_total_columns]
 
@@ -199,36 +335,20 @@ class Evaluation:
 
         results_summary = pd.DataFrame(data=[results_summary_data], columns=results_summary_columns)
 
-        self._write_csv(results_summary, results_total, results)
-        for key, configs in self.items():
-            if key == 'ees' or key == 'ev':
-                self._write_pdf(results_summary, results_total, results)
-                os.system(self._results_pdf)
-                break
-        # self._write_excel(results_summary, results_total, results)
-        return {
-            'status': 'success',
-            'yield_energy': yield_energy,
-            'yield_specific': yield_specific
-        }
-
-    def _write_csv(self, results_summary, results_total, results):
-        for key, configs in self.items():
-            configs_name = configs.name
-            # for configs_type in self._component_types:
-            #     configs_name = configs_name.replace(configs_type, '')
-            if len(configs_name) < 1:
-                configs_name += str(list(self.values()).index(configs) + 1)
-
-            results[key].to_csv(os.path.join(self._results_dir, 'results_' + configs_name + '.csv'),
-                                encoding='utf-8-sig')
-
-        results_total.to_csv(os.path.join(self._results_dir, 'results.csv'), encoding='utf-8-sig')
-        results_summary.to_csv(self._results_csv, encoding='utf-8-sig', index=False)
-
-        return results
+        # for key, configs in self.items():
+        #     if key == 'ees' or key == 'ev':
+        #         self._write_pdf(results_summary, results_total, results)
+        #         os.system(self._results_pdf)
+        #         break
+        return {}
 
     def _write_pdf(self, results_summary, results_total, results):
+        from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER, TA_RIGHT
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib import colors
+
         self._create_graphics(results_summary, results_total, results)
         doc = SimpleDocTemplate(self._results_pdf, pagesize=letter,
                                 rightMargin=72, leftMargin=72,
@@ -336,6 +456,8 @@ class Evaluation:
         print('PDF created successfully')
 
     def _create_graphics(self, results_summary, results_total, results):
+        from matplotlib import pyplot as plt
+
         size_large = 30
         size_medium = 27
         size_small = 24
@@ -393,63 +515,3 @@ class Evaluation:
                 ax3.tick_params(axis='y', labelsize=size_small)
                 ax3.tick_params(axis='x', labelsize=size_small)
                 plt.savefig(self._results_dir + '\\' + key + '_2')
-
-    def _write_excel(self, results_summary, results_total, results):
-        try:
-            from openpyxl import Workbook
-            from openpyxl.utils import get_column_letter
-            from openpyxl.styles import Border, Side
-
-            border_side = Side(border_style=None)
-            border = Border(top=border_side,
-                            right=border_side,
-                            bottom=border_side,
-                            left=border_side)
-
-            results_book = Workbook()
-            results_writer = pd.ExcelWriter(self._results_excel, engine='openpyxl', engine_kwargs={'encoding': 'utf-8-sig'})
-            results_writer.book = results_book
-            results_summary.to_excel(results_writer, sheet_name='Summary', float_format="%.2f", encoding='utf-8-sig')
-            results_book['Summary'].delete_cols(1, 1)
-            results_book.remove_sheet(results_book.active)
-            results_book.active = 0
-
-            results_total.tz_localize(None).to_excel(results_writer, sheet_name=self.name, encoding='utf-8-sig')
-
-            for key, configs in self.items():
-                configs_name = configs.name
-                for configs_type in self._component_types:
-                    configs_name = configs_name.replace(configs_type, '')
-                if len(configs_name) < 1:
-                    configs_name += str(list(self.values()).index(configs) + 1)
-
-                results[key].tz_localize(None).to_excel(results_writer,
-                                                        sheet_name=self.name + ' ' + configs_name,
-                                                        encoding='utf-8-sig')
-
-            results_summary.to_excel(results_writer, sheet_name='Summary', float_format="%.2f", encoding='utf-8-sig')
-            results_total.tz_localize(None).to_excel(results_writer, sheet_name=self.name, encoding='utf-8-sig')
-            results_book['Summary'].delete_cols(1, 1)
-            results_sheets = results_book._sheets
-            results_sheets.insert(0, results_sheets.pop(len(results_sheets) - 1))
-            results_sheets.insert(0, results_sheets.pop(len(results_sheets) - 1))
-
-            for result_sheet in results_book:
-                result_index_width = 0
-                for result_row in result_sheet:
-                    result_row[0].border = border
-                    result_index_width = max(result_index_width, len(str(result_row[0].value)))
-
-                result_sheet.column_dimensions[get_column_letter(1)].width = result_index_width + 2
-
-                for result_column in range(1, len(result_sheet[1])):
-                    result_column_width = len(str(result_sheet[1][result_column].value))
-                    result_sheet[1][result_column].border = border
-                    result_sheet.column_dimensions[get_column_letter(result_column+1)].width = result_column_width + 2
-
-            results_book.save(self._results_excel)
-            results_writer.close()
-
-        except ImportError as e:
-            logger.debug("Unable to write excel file for {} of system {}: {}".format(
-                os.path.abspath(self._results_excel), self.name, str(e)))

@@ -6,16 +6,14 @@
     
 """
 from __future__ import annotations
-from typing import Callable, Dict
+from typing import Callable
 
 import os
 import json
 import logging
 import pandas as pd
-import traceback
 import th_e_core
 from th_e_core import Component
-from th_e_core.io import DatabaseUnavailableException
 from th_e_core.configs import Configurations
 from pvlib import solarposition
 from .pv import PVSystem
@@ -132,145 +130,6 @@ class System(th_e_core.System, Evaluation):
         model = Model.read(pv)
         return model(weather).rename(columns={'p_ac': 'pv_power',
                                               'p_dc': 'dc_power'})
-
-    # noinspection PyProtectedMember
-    def evaluate(self, **kwargs):
-        from th_e_data import Results
-        from th_e_core.io._var import COLUMNS
-        from th_e_data.io import write_csv, write_excel
-        logger.info("Starting evaluation for system: %s", self.name)
-
-        results = Results(self)
-        results.durations.start('Evaluation')
-        results_key = f"{self.id}/output"
-        try:
-            if results_key not in results:
-                results.durations.start('Prediction')
-                result = self(results, self._results_json)
-                results.set(results_key, result)
-                results.durations.stop('Prediction')
-            else:
-                # If this component was simulated already, load the results and skip the calculation
-                results.load(results_key)
-            try:
-                reference = self._get_result(results, f"{self.id}/reference", self.database.read, **kwargs)
-
-                def add_reference(type: str, unit: str = 'power'):
-                    cmpts = self.get_type(type)
-                    if len(cmpts) > 0:
-                        if all([f'{cmpt.id}_{unit}' in reference.columns for cmpt in cmpts]):
-                            results.data[f'{type}_{unit}_ref'] = 0
-                            for cmpt in self.get_type(f'{type}'):
-                                results.data[f'{type}_{unit}_ref'] += reference[f'{cmpt.id}_{unit}']
-                        elif f'{type}_{unit}' in reference.columns:
-                            results.data[f'{type}_{unit}_ref'] = reference[f'{type}_{unit}']
-
-                        results.data[f'{type}_{unit}_err'] = (results.data[f'{type}_{unit}'] -
-                                                              results.data[f'{type}_{unit}_ref'])
-
-                add_reference('pv')
-
-            except DatabaseUnavailableException as e:
-                reference = None
-                logger.debug("Unable to retrieve reference values for system %s: %s", self.name, str(e))
-
-            def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
-                data = data.tz_convert(self.location.timezone).tz_localize(None)
-                data = data[[column for column in COLUMNS.keys() if column in data.columns]]
-                data.rename(columns=COLUMNS, inplace=True)
-                data.index.name = 'Time'
-                return data
-
-            summary = pd.DataFrame(columns=pd.MultiIndex.from_tuples((), names=['System', '']))
-            summary_json = {
-                'status': 'success'
-            }
-            self._evaluate(summary_json, summary, results.data, reference)
-
-            summary_data = {
-                self.name: prepare_data(results.data)
-            }
-            if len(self) > 1:
-                for cmpt in self.values():
-                    results_name = cmpt.name
-                    for cmpt_type in self.get_types():
-                        results_name = results_name.replace(cmpt_type, '')
-                    if len(results_name) < 1:
-                        results_name += str(list(self.values()).index(results_name) + 1)
-                    results_name = (self.name + results_name).title()
-                    summary_data[results_name] = prepare_data(results[f"{self.id}/{cmpt.id}"])
-
-            write_csv(self, summary, self._results_csv)
-            write_excel(summary, summary_data, file=self._results_excel)
-
-            with open(self._results_json, 'w', encoding='utf-8') as f:
-                json.dump(summary_json, f, ensure_ascii=False, indent=4)
-
-        except Exception as e:
-            logger.error("Error evaluating system %s: %s", self.name, str(e))
-            logger.debug("%s: %s", type(e).__name__, traceback.format_exc())
-
-            with open(self._results_json, 'w', encoding='utf-8') as f:
-                results_json = {
-                    'status': 'error',
-                    'message': str(e),
-                    'error': type(e).__name__,
-                    'trace': traceback.format_exc()
-                }
-                json.dump(results_json, f, ensure_ascii=False, indent=4)
-
-            raise e
-
-        finally:
-            results.durations.stop('Evaluation')
-            results.close()
-
-        logger.info("Evaluation complete")
-        logger.debug('Evaluation complete in %i minutes', results.durations['Evaluation'])
-
-        return results
-
-    def _evaluate(self,
-                  summary_json: Dict,
-                  summary: pd.DataFrame,
-                  results: pd.DataFrame,
-                  reference: pd.DataFrame = None) -> None:
-        summary_json.update(self._evaluate_yield(summary, results, reference))
-        summary_json.update(self._evaluate_weather(summary, results))
-
-    def _evaluate_yield(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
-        hours = pd.Series(results.index, index=results.index)
-        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
-        results_kwp = 0
-        for system in self.values():
-            results_kwp += system.power_max / 1000.
-
-        results['pv_energy'] = results['pv_power'] / 1000. * hours
-        results['pv_yield'] = results['pv_energy'] / results_kwp
-
-        results['dc_energy'] = results['dc_power'] / 1000. * hours
-
-        results.dropna(axis='index', how='all', inplace=True)
-
-        yield_specific = round(results['pv_yield'].sum(), 2)
-        yield_energy = round(results['pv_energy'].sum(), 2)
-
-        summary.loc[self.name, ('Yield', AC_E)] = yield_energy
-        summary.loc[self.name, ('Yield', AC_Y)] = yield_specific
-
-        return {'yield_energy': yield_energy,
-                'yield_specific': yield_specific}
-
-    def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
-        hours = pd.Series(results.index, index=results.index)
-        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
-        ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
-        dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
-
-        summary.loc[self.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
-        summary.loc[self.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
-
-        return {}
 
 
 class Progress:
