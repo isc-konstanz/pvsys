@@ -142,9 +142,8 @@ conf/*
 !conf/*.default.cfg
 
 # Generated output
-#data/
+data/
 #!lib/modules
 #lib/modules/*.csv
 #!lib/inverters
 #lib/inverters/*.csv
-data/
