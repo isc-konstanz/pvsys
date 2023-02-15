@@ -6,7 +6,7 @@
 
 """
 from __future__ import annotations
-from typing import Dict, Iterator
+from typing import Dict
 import os
 import json
 import logging
@@ -14,48 +14,89 @@ import numpy as np
 import pandas as pd
 import datetime as dt
 import traceback
-from th_e_core import System
+
+# noinspection PyProtectedMember
+from th_e_core.io._var import rename, COLUMNS
 from th_e_core.io import DatabaseUnavailableException
+from th_e_core.tools import to_bool
+from th_e_core import Configurations, Configurable, System
+from th_e_data.io import write_csv, write_excel
+from th_e_data import Results
 
 logger = logging.getLogger(__name__)
 
-AC_P = 'Power [W]'
+CMPTS = {
+    'tes': 'Buffer Storage',
+    'ees': 'Battery Storage',
+    'ev': 'Electric Vehicle',
+    'pv': 'Photovoltaics'
+}
+
 AC_E = 'Energy yield [kWh]'
 AC_Y = 'Specific yield [kWh/kWp]'
-DC_P = 'Power (DC) [W]'
 DC_E = 'Energy yield (DC) [kWh]'
 
 
-class Evaluation:
+class Evaluation(Configurable):
+
+    def __init__(self, system: System) -> None:
+        super().__init__(system.configs)
+        self.system = system
+
+    def __configure__(self, configs: Configurations) -> None:
+        super().__configure__(configs)
+        data_dir = configs.dirs.data
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
+
+        self._results_json = os.path.join(data_dir, 'results.json')
+        self._results_excel = os.path.join(data_dir, 'results.xlsx')
+        self._results_csv = os.path.join(data_dir, 'results.csv')
+        self._results_pdf = os.path.join(data_dir, 'results.pdf')
+        self._results_dir = os.path.join(data_dir, 'results')
+        if not os.path.exists(self._results_dir):
+            os.makedirs(self._results_dir)
 
     # noinspection PyProtectedMember
-    def evaluate(self, **kwargs):
-        from th_e_data import Results
-        from th_e_core.io._var import COLUMNS
-        from th_e_data.io import write_csv, write_excel
-        logger.info("Starting evaluation for system: %s", self.name)
+    def __call__(self, **kwargs) -> Results:
+        logger.info("Starting evaluation for system: %s", self.system.name)
+        progress = Progress(len(self.system) + 1, file=self._results_json)
 
-        results = Results(self)
+        results = Results(self.system)
         results.durations.start('Evaluation')
-        results_key = f"{self.id}/output"
+        results_key = f"{self.system.id}/output"
         try:
             if results_key not in results:
                 results.durations.start('Prediction')
-                result = self(results, self._results_json)
+                weather = _get(results, f"{self.system.id}/input", self.system._get_weather)
+                progress.update()
+
+                result = pd.DataFrame(columns=['pv_power', 'dc_power'], index=weather.index).fillna(0)
+                result.index.name = 'time'
+                for cmpt in self.system.values():
+                    if cmpt.type == 'pv':
+                        cmpt_key = f"{self.system.id}/{cmpt.id}/output"
+                        result_pv = _get(results, cmpt_key, self.system._get_solar_yield, cmpt, weather)
+                        result[['pv_power', 'dc_power']] += result_pv[['pv_power', 'dc_power']].abs()
+
+                    progress.update()
+
+                result = pd.concat([result, weather], axis=1)
                 results.set(results_key, result)
                 results.durations.stop('Prediction')
             else:
                 # If this component was simulated already, load the results and skip the calculation
                 results.load(results_key)
             try:
-                reference = self._get_result(results, f"{self.id}/reference", self.database.read, **kwargs)
+                reference = _get(results, f"{self.system.id}/reference", self.system.database.read, **kwargs)
 
+                # noinspection SpellCheckingInspection, PyShadowingBuiltins, PyShadowingNames
                 def add_reference(type: str, unit: str = 'power'):
-                    cmpts = self.get_type(type)
+                    cmpts = self.system.get_type(type)
                     if len(cmpts) > 0:
                         if all([f'{cmpt.id}_{unit}' in reference.columns for cmpt in cmpts]):
                             results.data[f'{type}_{unit}_ref'] = 0
-                            for cmpt in self.get_type(f'{type}'):
+                            for cmpt in self.system.get_type(f'{type}'):
                                 results.data[f'{type}_{unit}_ref'] += reference[f'{cmpt.id}_{unit}']
                         elif f'{type}_{unit}' in reference.columns:
                             results.data[f'{type}_{unit}_ref'] = reference[f'{type}_{unit}']
@@ -67,10 +108,10 @@ class Evaluation:
 
             except DatabaseUnavailableException as e:
                 reference = None
-                logger.debug("Unable to retrieve reference values for system %s: %s", self.name, str(e))
+                logger.debug("Unable to retrieve reference values for system %s: %s", self.system.name, str(e))
 
             def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
-                data = data.tz_convert(self.location.timezone).tz_localize(None)
+                data = data.tz_convert(self.system.location.timezone).tz_localize(None)
                 data = data[[column for column in COLUMNS.keys() if column in data.columns]]
                 data.rename(columns=COLUMNS, inplace=True)
                 data.index.name = 'Time'
@@ -83,26 +124,29 @@ class Evaluation:
             self._evaluate(summary_json, summary, results.data, reference)
 
             summary_data = {
-                self.name: prepare_data(results.data)
+                self.system.name: prepare_data(results.data)
             }
-            if len(self) > 1:
-                for cmpt in self.values():
-                    results_name = cmpt.name
-                    for cmpt_type in self.get_types():
-                        results_name = results_name.replace(cmpt_type, '')
-                    if len(results_name) < 1:
-                        results_name += str(list(self.values()).index(results_name) + 1)
-                    results_name = (self.name + results_name).title()
-                    summary_data[results_name] = prepare_data(results[f"{self.id}/{cmpt.id}"])
+            if len(self.system) > 1:
+                for cmpt in self.system.values():
+                    cmpt_key = f"{self.system.id}/{cmpt.id}/output"
+                    if cmpt_key in results:
+                        results_suffix = cmpt.name
+                        for cmpt_type in self.system.get_types():
+                            results_suffix = results_suffix.replace(cmpt_type, '')
+                        if len(results_suffix) < 1 and len(self.system.get_type(cmpt.type)) > 1:
+                            results_suffix += str(list(self.system.values()).index(cmpt) + 1)
+                        results_name = CMPTS[cmpt.type] if cmpt.type in CMPTS else cmpt.type.upper()
+                        results_name = f"{results_name} {results_suffix}".strip().title()
+                        summary_data[results_name] = prepare_data(results[cmpt_key])
 
-            write_csv(self, summary, self._results_csv)
+            write_csv(self.system, summary, self._results_csv)
             write_excel(summary, summary_data, file=self._results_excel)
 
             with open(self._results_json, 'w', encoding='utf-8') as f:
                 json.dump(summary_json, f, ensure_ascii=False, indent=4)
 
         except Exception as e:
-            logger.error("Error evaluating system %s: %s", self.name, str(e))
+            logger.error("Error evaluating system %s: %s", self.system.name, str(e))
             logger.debug("%s: %s", type(e).__name__, traceback.format_exc())
 
             with open(self._results_json, 'w', encoding='utf-8') as f:
@@ -137,7 +181,7 @@ class Evaluation:
         hours = pd.Series(results.index, index=results.index)
         hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
         results_kwp = 0
-        for system in self.values():
+        for system in self.system.values():
             results_kwp += system.power_max / 1000.
 
         results['pv_energy'] = results['pv_power'] / 1000. * hours
@@ -150,8 +194,8 @@ class Evaluation:
         yield_specific = round(results['pv_yield'].sum(), 2)
         yield_energy = round(results['pv_energy'].sum(), 2)
 
-        summary.loc[self.name, ('Yield', AC_E)] = yield_energy
-        summary.loc[self.name, ('Yield', AC_Y)] = yield_specific
+        summary.loc[self.system.name, ('Yield', AC_E)] = yield_energy
+        summary.loc[self.system.name, ('Yield', AC_Y)] = yield_specific
 
         return {'yield_energy': yield_energy,
                 'yield_specific': yield_specific}
@@ -162,8 +206,8 @@ class Evaluation:
         ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
         dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
 
-        summary.loc[self.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
-        summary.loc[self.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
+        summary.loc[self.system.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
+        summary.loc[self.system.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
 
         return {}
 
@@ -171,34 +215,13 @@ class Evaluation:
         hours = pd.Series(results.index, index=results.index)
         hours = round((hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600)
 
-        results_total_columns = [AC_P, AC_E, AC_Y, DC_P]
-        results_total = pd.DataFrame(index=results.index, columns=[AC_P, DC_P]).fillna(0)
-        results_total.index.name = 'Time'
-        results_kwp = 0
-        # results_avg = {}
-        energy_price = 0
-
-        for key, configs in self.items():
-            if key == 'array':
-                result = results[key]
-                results_kwp += float(configs.module_parameters['pdc0']) * configs.inverters_per_system * \
-                               configs.modules_per_inverter / 1000
-                results_total[[AC_P, DC_P]] += result[['p_ac', 'p_dc']].abs().values
-
-                p_pv = results[key]['p_dc'].to_frame()
-                p_pv = p_pv.groupby(p_pv.index.hour).mean()
-                p_pv = p_pv.rename(columns={'p_dc': 'p_pv'})
-                results.update({'daily': p_pv})
-
-        evaluation = False
         key = 'ees'
         if key in self:
             # TODO: Abfrage ob tz-infos vorhanden
             # p_isc.index = p_isc.index.tz_localize('Europe/Berlin')
             # TODO: N.A./null Werte in der Zeitreihe
-            evaluation = True
-            configs = self[key]
-            domestic = pd.read_csv(configs.data_path, delimiter=',', index_col='time', parse_dates=True,
+            configs = self.system[key]
+            domestic = pd.read_csv(configs.dirs.data, delimiter=',', index_col='time', parse_dates=True,
                                    dayfirst=True)
             start = domestic.index[0]
             stop = domestic.index[-1]
@@ -306,34 +329,6 @@ class Evaluation:
                           'ev potential': [ev_potential_min],
                           'house connection point': [configs.house_connection_point]}
             results.update({key: pd.DataFrame(data=results_ev)})
-
-        results_total[AC_E] = results_total[AC_P] / 1000 * hours
-        results_total[AC_Y] = results_total[AC_E] / results_kwp
-
-        results_total[DC_E] = results_total[DC_P] / 1000 * hours
-
-        results_total = results_total.dropna(axis='index', how='all')
-
-        yield_specific = round(results_total[AC_Y].sum(), 2)
-        yield_energy = round(results_total[AC_E].sum(), 2)
-
-        # self._database.get(file = ../data/system)
-
-        ghi = round((results['ghi'] / 1000 * hours).sum(), 2)
-        dhi = round((results['dhi'] / 1000 * hours).sum(), 2)
-
-        results_total = results_total[results_total_columns]
-
-        results_summary_columns = [AC_Y, AC_E]
-        results_summary_data = [yield_specific, yield_energy]
-
-        results_summary_columns.append('GHI [kWh/m^2]')
-        results_summary_data.append(ghi)
-
-        results_summary_columns.append('DHI [kWh/m^2]')
-        results_summary_data.append(dhi)
-
-        results_summary = pd.DataFrame(data=[results_summary_data], columns=results_summary_columns)
 
         # for key, configs in self.items():
         #     if key == 'ees' or key == 'ev':
@@ -456,15 +451,15 @@ class Evaluation:
         print('PDF created successfully')
 
     def _create_graphics(self, results_summary, results_total, results):
-        from matplotlib import pyplot as plt
+        from matplotlib import pyplot as plot
 
         size_large = 30
         size_medium = 27
         size_small = 24
         width = 0.6
-        for key, configs in self.items():
+        for key, configs in self.system.items():
             if key == 'array':
-                fig1, ax1 = plt.subplots(figsize=(10, 10))
+                fig1, ax1 = plot.subplots(figsize=(10, 10))
                 data = [
                     -results['ees']['costs_raw'].values[0].round(1),
                     -results['ees']['costs_pv'].values[0].round(1),
@@ -483,10 +478,10 @@ class Evaluation:
                 ax1.spines['top'].set_visible(False)
                 ax1.bar_label(plot1, padding=3, fontsize=size_small)
                 fig1.tight_layout()
-                plt.savefig(self._results_dir + '\\' + key)
+                plot.savefig(self._results_dir + '\\' + key)
 
             if key == 'ees':
-                fig2, ax2 = plt.subplots(figsize=(23, 15))
+                fig2, ax2 = plot.subplots(figsize=(23, 15))
                 # ax2.set_title('energy', fontsize=size_large)
                 ax2.plot(results['daily'], linewidth=2.5)
                 ax2.set_xlim([0, 23])
@@ -499,10 +494,10 @@ class Evaluation:
                 ax2.minorticks_on()
                 ax2.tick_params(axis='y', labelsize=size_small)
                 ax2.tick_params(axis='x', labelsize=size_small)
-                plt.savefig(self._results_dir + '\\' + key + '_1')
+                plot.savefig(self._results_dir + '\\' + key + '_1')
 
             if key == 'ev':
-                fig3, ax3 = plt.subplots(figsize=(23, 15))
+                fig3, ax3 = plot.subplots(figsize=(23, 15))
                 ax3.plot(results['daily']['p_pv'] - results['daily']['p_dom'], linewidth=2.5)
                 ax3.set_xlim([0, 23])
                 ax3.set_xlabel('hour of the day', fontsize=size_medium)
@@ -514,4 +509,38 @@ class Evaluation:
                 ax3.minorticks_on()
                 ax3.tick_params(axis='y', labelsize=size_small)
                 ax3.tick_params(axis='x', labelsize=size_small)
-                plt.savefig(self._results_dir + '\\' + key + '_2')
+                plot.savefig(self._results_dir + '\\' + key + '_2')
+
+
+# noinspection PyUnresolvedReferences
+def _get(results, key: str, func: Callable, *args, **kwargs) -> pd.DataFrame:
+    if results is None or key not in results:
+        concat = to_bool(kwargs.pop('concat', False))
+        result = func(*args, **kwargs)
+        if results is not None:
+            results.set(key, result, concat=concat)
+        return result
+
+    return results.get(key)
+
+
+class Progress:
+
+    def __init__(self, total, value=0, file=None):
+        self._file = file
+        self._total = total + 1
+        self._value = value
+
+    def update(self):
+        self._value += 1
+        self._update(self._value)
+
+    def _update(self, value):
+        progress = value / self._total * 100
+        if progress % 1 <= 1 / self._total * 100 and self._file is not None:
+            with open(self._file, 'w', encoding='utf-8') as f:
+                results = {
+                    'status': 'running',
+                    'progress': int(progress)
+                }
+                json.dump(results, f, ensure_ascii=False, indent=4)
