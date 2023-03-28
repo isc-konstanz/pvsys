@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-    th-e-yield.evaluation
-    ~~~~~~~~~~~~~~~~~
+    pvsys.evaluation
+    ~~~~~~~~~~~~~~~~
 
 
 """
@@ -10,21 +10,20 @@ from typing import Dict
 import os
 import json
 import logging
-import numpy as np
 import pandas as pd
-import datetime as dt
 import traceback
 
 # noinspection PyProtectedMember
-from th_e_core.io._var import rename, COLUMNS
-from th_e_core.io import DatabaseUnavailableException
-from th_e_core.tools import to_bool
-from th_e_core import Configurations, Configurable, System
-from th_e_data.io import write_csv, write_excel
-from th_e_data import Results
+from corsys.io._var import COLUMNS
+from corsys.io import DatabaseUnavailableException
+from corsys.tools import to_bool
+from corsys import Configurations, Configurable, System
+from scisys.io import write_csv, write_excel
+from scisys import Results
 
 logger = logging.getLogger(__name__)
 
+# noinspection SpellCheckingInspection
 CMPTS = {
     'tes': 'Buffer Storage',
     'ees': 'Battery Storage',
@@ -58,7 +57,7 @@ class Evaluation(Configurable):
             os.makedirs(self._results_dir)
 
     # noinspection PyProtectedMember
-    def __call__(self, **kwargs) -> Results:
+    def __call__(self, *args, **kwargs) -> Results:
         logger.info("Starting evaluation for system: %s", self.system.name)
         progress = Progress(len(self.system) + 1, file=self._results_json)
 
@@ -68,20 +67,20 @@ class Evaluation(Configurable):
         try:
             if results_key not in results:
                 results.durations.start('Prediction')
-                weather = _get(results, f"{self.system.id}/input", self.system._get_weather)
+                input = _get(results, f"{self.system.id}/input", self.system._get_input, *args, **kwargs)
                 progress.update()
 
-                result = pd.DataFrame(columns=['pv_power', 'dc_power'], index=weather.index).fillna(0)
+                result = pd.DataFrame(columns=['pv_power', 'dc_power'], index=input.index).fillna(0)
                 result.index.name = 'time'
                 for cmpt in self.system.values():
                     if cmpt.type == 'pv':
                         cmpt_key = f"{self.system.id}/{cmpt.id}/output"
-                        result_pv = _get(results, cmpt_key, self.system._get_solar_yield, cmpt, weather)
+                        result_pv = _get(results, cmpt_key, self.system._get_solar_yield, cmpt, input)
                         result[['pv_power', 'dc_power']] += result_pv[['pv_power', 'dc_power']].abs()
 
                     progress.update()
 
-                result = pd.concat([result, weather], axis=1)
+                result = pd.concat([result, input], axis=1)
                 results.set(results_key, result)
                 results.durations.stop('Prediction')
             else:
@@ -175,6 +174,7 @@ class Evaluation(Configurable):
                   results: pd.DataFrame,
                   reference: pd.DataFrame = None) -> None:
         summary_json.update(self._evaluate_yield(summary, results, reference))
+        summary_json.update(self._evaluate_system(summary, results, reference))
         summary_json.update(self._evaluate_weather(summary, results))
 
     def _evaluate_yield(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
@@ -200,18 +200,9 @@ class Evaluation(Configurable):
         return {'yield_energy': yield_energy,
                 'yield_specific': yield_specific}
 
-    def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
-        hours = pd.Series(results.index, index=results.index)
-        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
-        ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
-        dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
-
-        summary.loc[self.system.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
-        summary.loc[self.system.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
-
+    def _evaluate_system(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
         return {}
 
-    def _evaluate_system(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
         hours = pd.Series(results.index, index=results.index)
         hours = round((hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600)
 
@@ -335,6 +326,17 @@ class Evaluation(Configurable):
         #         self._write_pdf(results_summary, results_total, results)
         #         os.system(self._results_pdf)
         #         break
+        return {}
+
+    def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
+        hours = pd.Series(results.index, index=results.index)
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
+        ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
+        dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
+
+        summary.loc[self.system.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
+        summary.loc[self.system.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
+
         return {}
 
     def _write_pdf(self, results_summary, results_total, results):
