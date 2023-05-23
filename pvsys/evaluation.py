@@ -206,12 +206,16 @@ class Evaluation(Configurable):
         hours = pd.Series(results.index, index=results.index)
         hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
 
-        if reference is not None and System.POWER_EL in reference.columns:
+        if reference is not None and System.POWER_EL in reference.columns and \
+                self.system.contains_type(ElectricalEnergyStorage.TYPE):
+            results[ElectricalEnergyStorage.POWER_CHARGE] = 0
+            ees_cycles = 0
             for ees in self.system.get_type(ElectricalEnergyStorage.TYPE):
-                ees_results = ees.infer_soc(results)
-                results.add(ees_results[ees.POWER_CHARGE])
+                ees_results = ees.infer_soc(reference)
+                ees_cycles += (results[ees.POWER_CHARGE] / 1000 * hours).sum() / ees.capacity
+                results[ees.POWER_CHARGE] = ees_results[ees.POWER_CHARGE]
 
-            ees_cycles = (results[ees.POWER_CHARGE] / 1000 * hours).sum() / ees.capacity
+            # ToDo: Verify if cycles should summed or averaged
             summary.loc[self.system.name, ('BatteryStorage', 'Cycles')] = ees_cycles
 
             return {'ees_cycles': ees_cycles}
