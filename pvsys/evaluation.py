@@ -16,7 +16,7 @@ import traceback
 # noinspection PyProtectedMember
 from corsys.io._var import COLUMNS
 from corsys.io import DatabaseUnavailableException
-from corsys.cmpt import Photovoltaic
+from corsys.cmpt import Photovoltaic, ElectricalEnergyStorage
 from corsys import Configurations, Configurable, System
 from scisys.io import write_csv, write_excel
 from scisys import Results
@@ -203,6 +203,18 @@ class Evaluation(Configurable):
                 'yield_specific': yield_specific}
 
     def _evaluate_system(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
+        hours = pd.Series(results.index, index=results.index)
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
+
+        if reference is not None and System.POWER_EL in reference.columns:
+            for ees in self.system.get_type(ElectricalEnergyStorage.TYPE):
+                ees_results = ees.infer_soc(results)
+                results.add(ees_results[ees.POWER_CHARGE])
+
+            ees_cycles = (results[ees.POWER_CHARGE] / 1000 * hours).sum() / ees.capacity
+            summary.loc[self.system.name, ('BatteryStorage', 'Cycles')] = ees_cycles
+
+            return {'ees_cycles': ees_cycles}
         return {}
 
         hours = pd.Series(results.index, index=results.index)
