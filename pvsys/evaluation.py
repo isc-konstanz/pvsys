@@ -35,6 +35,8 @@ AC_E = 'Energy yield [kWh]'
 AC_Y = 'Specific yield [kWh/kWp]'
 DC_E = 'Energy yield (DC) [kWh]'
 
+EES_CY = 'Cycles'
+
 
 class Evaluation(Configurable):
 
@@ -77,7 +79,7 @@ class Evaluation(Configurable):
                         cmpt_key = f"{self.system.id}/{cmpt.id}/output"
                         result_pv = _get(results, cmpt_key, self.system._get_solar_yield, cmpt, input)
                         result[['pv_power', 'dc_power']] += result_pv[['pv_power', 'dc_power']].abs()
-                        # result[f'{cmpt.id}_power'] = result_pv['pv_power']
+                        result[f'{cmpt.id}_power'] = result_pv['pv_power']
 
                     progress.update()
 
@@ -94,17 +96,23 @@ class Evaluation(Configurable):
                 # noinspection PyShadowingBuiltins, PyShadowingNames
                 def add_reference(type: str, unit: str = 'power'):
                     cmpts = self.system.get_type(type)
-                    if len(cmpts) > 0:
-                        if all([f'{cmpt.id}_{unit}' in reference.columns for cmpt in cmpts]):
-                            results.data[f'{type}_{unit}_ref'] = 0
-                            for cmpt in self.system.get_type(f'{type}'):
-                                results.data[f'{type}_{unit}_ref'] += reference[f'{cmpt.id}_{unit}']
-                        elif f'{type}_{unit}' in reference.columns:
-                            results.data[f'{type}_{unit}_ref'] = reference[f'{type}_{unit}']
+                    if len(cmpts) > 0 and all([f'{cmpt.id}_{unit}' in reference.columns for cmpt in cmpts]):
+                        results.data[f'{type}_{unit}_ref'] = 0
+                        for cmpt in self.system.get_type(f'{type}'):
+                            cmpt_ref = reference[f'{cmpt.id}_{unit}']
+                            results.data[f'{type}_{unit}_ref'] += cmpt_ref
+                            results.data[f'{cmpt.id}_{unit}_ref'] = cmpt_ref
+                            results.data[f'{cmpt.id}_{unit}_err'] = (results.data[f'{cmpt.id}_{unit}'] - cmpt_ref)
 
                         results.data[f'{type}_{unit}_err'] = (results.data[f'{type}_{unit}'] -
                                                               results.data[f'{type}_{unit}_ref'])
+                    elif f'{type}_{unit}' in reference.columns:
+                        results.data[f'{type}_{unit}_ref'] = reference[f'{type}_{unit}']
 
+                add_reference('el')
+                add_reference('th')
+                add_reference('th_ht')
+                add_reference('th_dom')
                 add_reference(Photovoltaic.TYPE)
 
             except DatabaseUnavailableException as e:
@@ -122,7 +130,7 @@ class Evaluation(Configurable):
             summary_json = {
                 'status': 'success'
             }
-            self._evaluate(summary_json, summary, results.data, reference)
+            self._evaluate(summary_json, summary, results.data)
 
             summary_data = {
                 self.system.name: prepare_data(results.data)
@@ -135,7 +143,7 @@ class Evaluation(Configurable):
                         for cmpt_type in self.system.get_types():
                             results_suffix = results_suffix.replace(cmpt_type, '')
                         if len(results_suffix) < 1 and len(self.system.get_type(cmpt.type)) > 1:
-                            results_suffix += str(list(self.system.values()).index(cmpt) + 1)
+                            results_suffix += str(list(self.system).index(cmpt) + 1)
                         results_name = CMPTS[cmpt.type] if cmpt.type in CMPTS else cmpt.type.upper()
                         results_name = f"{results_name} {results_suffix}".strip().title()
                         summary_data[results_name] = prepare_data(results[cmpt_key])
@@ -173,21 +181,35 @@ class Evaluation(Configurable):
     def _evaluate(self,
                   summary_json: Dict,
                   summary: pd.DataFrame,
-                  results: pd.DataFrame,
-                  reference: pd.DataFrame = None) -> None:
-        summary_json.update(self._evaluate_yield(summary, results, reference))
-        summary_json.update(self._evaluate_system(summary, results, reference))
+                  results: pd.DataFrame) -> None:
+
+        summary_json.update(self._evaluate_yield(summary, results))
+        summary_json.update(self._evaluate_storage(summary, results))
         summary_json.update(self._evaluate_weather(summary, results))
 
-    def _evaluate_yield(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
+    def _evaluate_yield(self, summary: pd.DataFrame, results: pd.DataFrame, *_) -> Dict:
+        if Photovoltaic.POWER not in results.columns or not self.system.contains_type(Photovoltaic.TYPE):
+            return {}
+
+        results_kwp = 0
+        for pv in self.system.get_type(Photovoltaic.TYPE):
+            if f'{pv.id}_power' in results.columns and f'{pv.id}_power_ref' not in results.columns:
+                if System.POWER_EL not in results.columns and f'{System.POWER_EL}_ref' in results.columns:
+                    results.loc[:, System.POWER_EL] = results[f'{System.POWER_EL}_ref']
+                if System.POWER_EL in results.columns:
+                    results.loc[:, System.POWER_EL] -= results[f'{pv.id}_power']
+
+            results_kwp += pv.power_max / 1000.
+
+        if System.POWER_EL in results.columns and f'{System.POWER_EL}_ref' in results.columns:
+            results[f'{System.POWER_EL}_err'] = (results[f'{System.POWER_EL}'] -
+                                                 results[f'{System.POWER_EL}_ref'])
+
         hours = pd.Series(results.index, index=results.index)
         hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
-        results_kwp = 0
-        for system in self.system.values():
-            results_kwp += system.power_max / 1000.
 
-        results['pv_energy'] = results['pv_power'] / 1000. * hours
-        results['pv_yield'] = results['pv_energy'] / results_kwp
+        results['pv_energy'] = results[Photovoltaic.POWER] / 1000. * hours
+        results['pv_yield'] = results[Photovoltaic.ENERGY] / results_kwp
 
         results['dc_energy'] = results['dc_power'] / 1000. * hours
 
@@ -202,28 +224,60 @@ class Evaluation(Configurable):
         return {'yield_energy': yield_energy,
                 'yield_specific': yield_specific}
 
-    def _evaluate_system(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
+    def _evaluate_storage(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
+        if System.POWER_EL not in results.columns and f'{System.POWER_EL}_ref' in results.columns:
+            results.loc[:, System.POWER_EL] = results[f'{System.POWER_EL}_ref']
+
+        elif System.POWER_EL not in results.columns or not self.system.contains_type(ElectricalEnergyStorage.TYPE):
+            return {}
+
+        ees_results = []
+        for ees in self.system.get_type(ElectricalEnergyStorage.TYPE):
+            ees_result = ees.infer_soc(results)
+            ees_results.append(ees_result)
+            results.loc[:, System.POWER_EL] = ees_result[System.POWER_EL]
+
+        if System.POWER_EL in results.columns and f'{System.POWER_EL}_ref' in results.columns:
+            results[f'{System.POWER_EL}_err'] = (results[f'{System.POWER_EL}'] -
+                                                 results[f'{System.POWER_EL}_ref'])
+
+        def insert(column: str, how: str) -> None:
+            data = pd.concat(ees_results, axis='columns').loc[:, [column]]
+            if len(data.columns) > 1:
+                if how == 'sum':
+                    data = data.sum(axis='columns')
+                elif how == 'mean':
+                    data = data.mean(axis='columns')
+            results.loc[:, column] = data
+
+        insert(ElectricalEnergyStorage.STATE_OF_CHARGE, how='mean')
+        insert(ElectricalEnergyStorage.POWER_DISCHARGE, how='sum')
+        insert(ElectricalEnergyStorage.POWER_CHARGE, how='sum')
+
         hours = pd.Series(results.index, index=results.index)
         hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
 
-        if reference is not None and System.POWER_EL in reference.columns and \
-                self.system.contains_type(ElectricalEnergyStorage.TYPE):
-            results[ElectricalEnergyStorage.POWER_CHARGE] = 0
-            ees_cycles = 0
-            for ees in self.system.get_type(ElectricalEnergyStorage.TYPE):
-                ees_results = ees.infer_soc(reference)
-                ees_cycles += (results[ees.POWER_CHARGE] / 1000 * hours).sum() / ees.capacity
-                results[ees.POWER_CHARGE] = ees_results[ees.POWER_CHARGE]
+        ees_capacity = sum([ees.capacity for ees in self.system.get_type(ElectricalEnergyStorage.TYPE)])
+        ees_cycles = (results[ElectricalEnergyStorage.POWER_CHARGE] / 1000 * hours).sum() / ees_capacity
 
-            # ToDo: Verify if cycles should summed or averaged
-            summary.loc[self.system.name, ('BatteryStorage', 'Cycles')] = ees_cycles
+        summary.loc[self.system.name, ('Battery storage', EES_CY)] = ees_cycles
 
-            return {'ees_cycles': ees_cycles}
+        return {'ees_cycles': ees_cycles}
+
+    def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
+        hours = pd.Series(results.index, index=results.index)
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
+        ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
+        dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
+
+        summary.loc[self.system.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
+        summary.loc[self.system.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
+
         return {}
 
+    def _evaluate_legacy(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
         hours = pd.Series(results.index, index=results.index)
-        hours = round((hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600)
-
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
         key = 'ees'
         if key in self:
             # TODO: Abfrage ob tz-infos vorhanden
@@ -344,17 +398,6 @@ class Evaluation(Configurable):
         #         self._write_pdf(results_summary, results_total, results)
         #         os.system(self._results_pdf)
         #         break
-        return {}
-
-    def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
-        hours = pd.Series(results.index, index=results.index)
-        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
-        ghi = round((results['ghi'] / 1000. * hours).sum(), 2)
-        dhi = round((results['dhi'] / 1000. * hours).sum(), 2)
-
-        summary.loc[self.system.name, ('Weather', 'GHI [kWh/m^2]')] = ghi
-        summary.loc[self.system.name, ('Weather', 'DHI [kWh/m^2]')] = dhi
-
         return {}
 
     def _write_pdf(self, results_summary, results_total, results):
