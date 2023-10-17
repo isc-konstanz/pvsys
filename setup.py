@@ -32,13 +32,13 @@ MAINTAINER_EMAIL = 'adrian.minde@isc-konstanz.de'
 URL = 'https://github.com/isc-konstanz/pvsys'
 
 INSTALL_REQUIRES = [
-    'pvlib >= 0.9',
+    'pvlib >= 0.10.1',
     'NREL-PySAM >= 4.0',
-    'corsys @ git+https://github.com/isc-konstanz/corsys.git@stable'
+    'corsys @ git+https://github.com/isc-konstanz/corsys.git@v0.8.2'
 ]
 
 EXTRAS_REQUIRE = {
-    'eval': ['scisys[excel,plot] @ git+https://github.com/isc-konstanz/scisys.git@stable']
+    'eval': ['scisys[excel,plot] @ git+https://github.com/isc-konstanz/scisys.git@v0.2.8']
 }
 
 SCRIPTS = ['bin/pvsys']
