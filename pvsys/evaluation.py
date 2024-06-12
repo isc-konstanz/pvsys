@@ -82,6 +82,10 @@ class Evaluation(Configurable):
             os.makedirs(self._plots_dir)
 
         self._targets = {
+            'el': configs.get('References', System.POWER_EL, fallback=System.POWER_EL),
+            'th': configs.get('References', System.POWER_TH, fallback=System.POWER_TH),
+            'th_ht': configs.get('References', System.POWER_TH_HT, fallback=System.POWER_TH_HT),
+            'th_dom': configs.get('References', System.POWER_TH_DOM, fallback=System.POWER_TH_DOM),
             PVSystem.TYPE: configs.get('References', PVSystem.TYPE, fallback=PVSystem.POWER)
         }
 
@@ -110,7 +114,7 @@ class Evaluation(Configurable):
                         result = result_pv.loc[:, result_pv.columns.str.contains('pv.*_power')]
                     else:
                         result += result_pv.loc[:, result_pv.columns.str.contains('pv.*_power')]
-                    #result[f'{cmpt.id}_power'] = result_pv[PVSystem.POWER]
+                    result[f'{cmpt.id}_power'] = result_pv[PVSystem.POWER]
 
                     progress.update()
 
@@ -126,31 +130,26 @@ class Evaluation(Configurable):
 
                 # noinspection PyTypeChecker, PyShadowingBuiltins, PyShadowingNames
                 def add_reference(cmpt_type: str, target: str):
-                    cmpts = self.system.get_type(cmpt_type)
-                    if len(cmpts) > 0:
-                        if all([target.replace(cmpt_type, cmpt.id) in references.columns or
-                                f'{target.replace(cmpt_type, cmpt.id)}_ref' in references.columns
-                                for cmpt in cmpts]):
-                            results.data[f'{cmpt_type}_ref'] = 0
-                            for cmpt in self.system.get_type(f'{cmpt_type}'):
-                                cmpt_target = target.replace(cmpt_type, cmpt.id)
-                                cmpt_reference = (references[f'{cmpt_target}'] if cmpt_target in references.columns else
-                                                  references[f'{cmpt_target}_ref'])
-                                results.data[f'{target}_ref'] += cmpt_reference
+                    cmpts = self.system.get_type(cmpt_type) if cmpt_type is not None else []
+                    if (len(cmpts) > 0
+                        and all([target.replace(cmpt_type, cmpt.id) in references.columns or
+                                f'{target.replace(cmpt_type, cmpt.id)}_ref' in references.columns for cmpt in cmpts])):
+                        results.data[f'{cmpt_type}_ref'] = 0
+                        for cmpt in self.system.get_type(f'{cmpt_type}'):
+                            cmpt_target = target.replace(cmpt_type, cmpt.id)
+                            cmpt_reference = (references[f'{cmpt_target}'] if cmpt_target in references.columns else
+                                              references[f'{cmpt_target}_ref'])
+                            results.data[f'{target}_ref'] += cmpt_reference
 
-                        elif target in references.columns:
-                            results.data[f'{target}_ref'] = references[target]
+                    elif target in references.columns:
+                        results.data[f'{target}_ref'] = references[target]
 
-                        elif f'{target}_ref' in references.columns:
-                            results.data[f'{target}_ref'] = references[f'{target}_ref']
+                    elif f'{target}_ref' in references.columns:
+                        results.data[f'{target}_ref'] = references[f'{target}_ref']
 
+                    if f'{target}_ref' in results.data and target in results.data:
                         results.data[f'{target}_err'] = (results.data[target] -
                                                          results.data[f'{target}_ref'])
-
-                # add_reference('el')
-                # add_reference('th')
-                # add_reference('th_ht')
-                # add_reference('th_dom')
 
                 for cmpt_type, target in self._targets.items():
                     add_reference(cmpt_type, target)
@@ -241,10 +240,12 @@ class Evaluation(Configurable):
     def _evaluate(self,
                   summary_json: Dict,
                   summary: pd.DataFrame,
-                  results: pd.DataFrame) -> None:
+                  results: pd.DataFrame,
+                  reference: pd.DataFrame = None) -> None:
 
-        summary_json.update(self._evaluate_yield(summary, results))
+        summary_json.update(self._evaluate_yield(summary, results, reference))
         summary_json.update(self._evaluate_storage(summary, results))
+        summary_json.update(self._evaluate_grid(summary, results))
         summary_json.update(self._evaluate_weather(summary, results))
 
     def _evaluate_yield(self, summary: pd.DataFrame, results: pd.DataFrame, reference: pd.DataFrame = None) -> Dict:
@@ -283,7 +284,7 @@ class Evaluation(Configurable):
                   colors=list(reversed(plot.COLORS)), file=os.path.join(self._plots_dir, 'yield_months_profile.png'))
 
         yield_specific = round(results[PVSystem.YIELD_SPECIFIC].sum(), 2)
-        yield_energy, yield_energy_column = self._scale_yield(results[PVSystem.ENERGY].sum(), AC_E)
+        yield_energy, yield_energy_column = self._scale_energy(results[PVSystem.ENERGY].sum(), AC_E)
 
         summary.loc[self.system.name, ('Yield', AC_Y)] = yield_specific
         summary.loc[self.system.name, ('Yield', yield_energy_column)] = yield_energy
@@ -292,7 +293,7 @@ class Evaluation(Configurable):
                         'yield_energy': yield_energy}
 
         if PVSystem.ENERGY_DC in results:
-            dc_energy, dc_energy_column = self._scale_yield(results[PVSystem.ENERGY_DC].sum(), DC_E)
+            dc_energy, dc_energy_column = self._scale_energy(results[PVSystem.ENERGY_DC].sum(), DC_E)
 
             summary.loc[self.system.name, ('Yield', dc_energy_column)] = dc_energy
             summary_dict['yield_energy_dc'] = dc_energy
@@ -339,6 +340,39 @@ class Evaluation(Configurable):
 
         return {'ees_cycles': ees_cycles}
 
+    def _evaluate_grid(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
+        if System.POWER_EL not in results.columns and f'{System.POWER_EL}_ref' in results.columns:
+            results.loc[:, System.POWER_EL] = results[f'{System.POWER_EL}_ref']
+        if System.POWER_EL not in results.columns:
+            return {}
+
+        hours = pd.Series(results.index, index=results.index)
+        hours = (hours - hours.shift(1)).fillna(method='bfill').dt.total_seconds() / 3600.
+
+        grid_import_power = results[System.POWER_EL].where(results[System.POWER_EL] >= 0, other=0)
+        (grid_import_energy,
+         grid_import_column) = self._scale_energy((grid_import_power / 1000 * hours).sum(), 'Import [kWh]')
+        (grid_import_max,
+         grid_import_max_column) = self._scale_power(grid_import_power.max(), 'Import peak [W]')
+
+        grid_export_power = results[System.POWER_EL].where(results[System.POWER_EL] <= 0, other=0).abs()
+        (grid_export_energy,
+         grid_export_column) = self._scale_energy((grid_export_power / 1000 * hours).sum(), 'Export [kWh]')
+        (grid_export_max,
+         grid_export_max_column) = self._scale_power(grid_export_power.max(), 'Export peak [W]')
+
+        summary.loc[self.system.name, ('Grid', grid_import_column)] = grid_import_energy
+        summary.loc[self.system.name, ('Grid', grid_export_column)] = grid_export_energy
+        summary.loc[self.system.name, ('Grid', grid_import_max_column)] = grid_import_max
+        summary.loc[self.system.name, ('Grid', grid_export_max_column)] = grid_export_max
+
+        summary_dict = {'grid_import': grid_import_energy,
+                        'grid_export': grid_export_energy,
+                        'grid_import_max': grid_import_max,
+                        'grid_export_max': grid_export_max}
+
+        return summary_dict
+
     def _evaluate_weather(self, summary: pd.DataFrame, results: pd.DataFrame) -> Dict:
         hours = pd.Series(results.index, index=results.index)
         hours = (hours - hours.shift(1)).bfill().dt.total_seconds() / 3600.
@@ -351,7 +385,17 @@ class Evaluation(Configurable):
         return {}
 
     @staticmethod
-    def _scale_yield(energy: float, column: str) -> Tuple[float, str]:
+    def _scale_power(power: float, column: str) -> Tuple[float, str]:
+        if power >= 1e7:
+            power = round(power / 1e6)
+            column = column.replace('W', 'MW')
+        elif power >= 1e4:
+            power = round(power / 1e3)
+            column = column.replace('W', 'kW')
+        return round(power, 2), column
+
+    @staticmethod
+    def _scale_energy(energy: float, column: str) -> Tuple[float, str]:
         if energy >= 1e7:
             energy = round(energy / 1e6)
             column = column.replace('kWh', 'GWh')
