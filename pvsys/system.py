@@ -31,7 +31,21 @@ logger = logging.getLogger(__name__)
 
 class System(core.System):
 
-    def __location__(self, configs: Configurations) -> Location:
+    POWER_EL = 'el_power'
+    POWER_EL_IMP = 'el_import_power'
+    POWER_EL_EXP = 'el_export_power'
+    POWER_TH = 'th_power'
+    POWER_TH_HT = 'th_ht_power'
+    POWER_TH_DOM = 'th_dom_power'
+
+    ENERGY_EL = 'el_energy'
+    ENERGY_EL_IMP = 'el_import_energy'
+    ENERGY_EL_EXP = 'el_export_energy'
+    ENERGY_TH = 'th_energy'
+    ENERGY_TH_HT = 'th_ht_energy'
+    ENERGY_TH_DOM = 'th_dom_energy'
+
+    def __locate__(self, configs: Configurations) -> Location:
         # FIXME: location necessary for for weather instantiation, but called afterwards here
         # if isinstance(self.weather, TMYWeather):
         #     return Location.from_tmy(self.weather.meta)
@@ -182,7 +196,11 @@ class System(core.System):
     def _get_solar_yield(self, pv: PVSystem, weather: pd.DataFrame) -> pd.DataFrame:
         model = Model.read(pv)
         return model(weather).rename(columns={'p_ac': PVSystem.POWER,
-                                              'p_dc': PVSystem.POWER_DC})
+                                              'p_dc': PVSystem.POWER_DC,
+                                              'i_sc': PVSystem.CURRENT_DC_SC,
+                                              'v_oc': PVSystem.VOLTAGE_DC_OC,
+                                              'i_mp': PVSystem.CURRENT_DC_MP,
+                                              'v_mp': PVSystem.VOLTAGE_DC_MP})
 
     # noinspection PyShadowingBuiltins
     def evaluate(self, **kwargs):
