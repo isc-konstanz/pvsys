@@ -422,6 +422,8 @@ class PVArray(Configurable, pv.pvsystem.Array):
 
     def _read_module_configs(self, params: dict) -> bool:
         module_file = os.path.join(self._override_dir, self.name.replace('array', 'module') + '.cfg')
+        if not os.path.exists(module_file):
+            module_file = os.path.join(self._override_dir, 'module.cfg')
         if os.path.exists(module_file):
             with open(module_file) as f:
                 module_str = '[Module]\n' + f.read()
